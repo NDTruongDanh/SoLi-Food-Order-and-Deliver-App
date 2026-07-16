@@ -30,7 +30,6 @@
     "db:push": "pnpm run db:extensions && drizzle-kit push",
     "db:seed:nutrition:usda": "tsx src/drizzle/seeds/usda-foundation-foods.seed.ts",
     "ai-search:backfill-embeddings": "tsx src/module/restaurant-catalog/search/indexing/ai-search-backfill.ts",
-    "ai-search:refresh-ranking-stats": "tsx src/module/restaurant-catalog/search/ai/ai-search-ranking-stats-refresh.ts",
     "db:seed:admin": "tsx src/drizzle/seeds/admin.seed.ts",
     "db:seed:dietary-tags": "tsx src/drizzle/seeds/dietary-tags.seed.ts",
     "db:seed:restaurants": "pnpm run db:seed:dietary-tags && tsx src/drizzle/seeds/vegan-nutrition.seed.ts && tsx src/drizzle/seeds/beverage-restaurants.seed.ts && tsx src/drizzle/seeds/food-and-beverage-restaurants.seed.ts && tsx src/drizzle/seeds/nearby-vnu-nutrition.seed.ts && tsx src/drizzle/seeds/reviews.seed.ts",

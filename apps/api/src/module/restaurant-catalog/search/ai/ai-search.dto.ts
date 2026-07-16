@@ -76,7 +76,7 @@ export class AiSearchAppliedFilterDto {
   label!: string;
 
   @ApiProperty({
-    enum: ['request', 'ai_inferred', 'system_default'],
+    enum: ['request', 'ai_inferred'],
     example: 'ai_inferred',
   })
   source!: 'request' | 'ai_inferred' | 'system_default';
@@ -91,7 +91,10 @@ export class AiSearchFollowUpDto {
 }
 
 export class AiSearchFallbackDto {
-  @ApiProperty({ example: 'EXACT_FOOD_NAME' })
+  @ApiProperty({
+    enum: ['ROUTER_UNAVAILABLE', 'ROUTER_INVALID_RESPONSE', 'EMBEDDING_FAILED'],
+    example: 'EMBEDDING_FAILED',
+  })
   reason!: string;
 }
 

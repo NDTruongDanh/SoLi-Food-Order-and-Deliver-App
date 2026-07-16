@@ -28,50 +28,6 @@ export const aiSearchLatencyMs = meter.createHistogram(
   },
 );
 
-export const aiSearchBranchLatencyMs = meter.createHistogram(
-  'api.domain.ai_search.branch_latency_ms',
-  {
-    description: 'AI search retrieval branch latency in milliseconds',
-    unit: 'ms',
-  },
-);
-
-export const aiSearchBranchHitsCount = meter.createCounter(
-  'api.domain.ai_search.branch_hits.count',
-  {
-    description: 'AI search retrieval branch hit counts',
-  },
-);
-
-export const aiSearchRankingLatencyMs = meter.createHistogram(
-  'api.domain.ai_search.ranking_latency_ms',
-  {
-    description: 'AI search ranking latency in milliseconds',
-    unit: 'ms',
-  },
-);
-
-export const aiSearchRankingCandidatesCount = meter.createHistogram(
-  'api.domain.ai_search.ranking_candidates.count',
-  {
-    description: 'AI search ranking candidate counts',
-  },
-);
-
-export const aiSearchDiversitySuppressedCount = meter.createCounter(
-  'api.domain.ai_search.diversity_suppressed.count',
-  {
-    description: 'AI search results deferred by restaurant diversity',
-  },
-);
-
-export const aiSearchSemanticFallbackCount = meter.createCounter(
-  'api.domain.ai_search.semantic_fallback.count',
-  {
-    description: 'AI search semantic branch fallback count',
-  },
-);
-
 export const aiSearchEmbeddingJobCount = meter.createCounter(
   'api.domain.ai_search.embedding_jobs.count',
   {
@@ -131,50 +87,6 @@ export function recordAiSearch(attributes: {
 
   aiSearchCount.add(1, metricAttributes);
   aiSearchLatencyMs.record(attributes.latencyMs, metricAttributes);
-}
-
-export function recordAiSearchBranch(attributes: {
-  branch: string;
-  target: 'items' | 'restaurants';
-  hitCount: number;
-  latencyMs: number;
-}) {
-  const metricAttributes = {
-    branch: attributes.branch,
-    target: attributes.target,
-  };
-  aiSearchBranchHitsCount.add(attributes.hitCount, metricAttributes);
-  aiSearchBranchLatencyMs.record(attributes.latencyMs, metricAttributes);
-}
-
-export function recordAiSearchRanking(attributes: {
-  target: 'items' | 'restaurants';
-  mode: 'legacy' | 'v2';
-  candidateCount: number;
-  outputCount: number;
-  diversitySuppressedCount: number;
-  latencyMs: number;
-}) {
-  const metricAttributes = {
-    target: attributes.target,
-    mode: attributes.mode,
-  };
-
-  aiSearchRankingCandidatesCount.record(
-    attributes.candidateCount,
-    metricAttributes,
-  );
-  aiSearchRankingLatencyMs.record(attributes.latencyMs, metricAttributes);
-  if (attributes.diversitySuppressedCount > 0) {
-    aiSearchDiversitySuppressedCount.add(
-      attributes.diversitySuppressedCount,
-      metricAttributes,
-    );
-  }
-}
-
-export function recordAiSearchSemanticFallback(reason: string) {
-  aiSearchSemanticFallbackCount.add(1, { reason });
 }
 
 export function recordAiSearchEmbeddingJob(attributes: {

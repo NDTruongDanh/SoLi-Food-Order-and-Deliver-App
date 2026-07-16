@@ -21,7 +21,7 @@ export class AiSearchController {
   @ApiOperation({
     summary: 'AI-assisted grounded food search',
     description:
-      'Interprets a natural-language food search, retrieves real menu and restaurant data, ranks deterministically, and uses classic search only for confident direct food-name lookups.',
+      'Routes a natural-language food search into validated catalog filters and a semantic query, retrieves menu items with pgvector cosine distance, and falls back to classic search when routing or embedding fails.',
   })
   @ApiBody({ type: AiSearchRequestDto })
   @ApiOkResponse({

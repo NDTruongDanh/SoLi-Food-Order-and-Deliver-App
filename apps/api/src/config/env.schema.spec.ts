@@ -84,6 +84,12 @@ describe('environment schema observability settings', () => {
     expect(env.AI_SEARCH_EMBEDDING_MODEL).toBe('embeddinggemma');
   });
 
+  it('rejects an embedding dimension that does not match the vector columns', () => {
+    expect(() =>
+      validate({ ...baseConfig, AI_SEARCH_EMBEDDING_DIMENSIONS: '1536' }),
+    ).toThrow(/fixed at 768/);
+  });
+
   it('allows an empty Ollama API key at startup', () => {
     const env = validate({
       ...baseConfig,
@@ -93,32 +99,13 @@ describe('environment schema observability settings', () => {
     expect(env.OLLAMA_API_KEY).toBe('');
   });
 
-  it('rejects invalid AI search ranking weights', () => {
-    expect(() =>
-      validate({
-        ...baseConfig,
-        AI_SEARCH_RANKING_WEIGHTS:
-          '{"retrieval":0,"nutrition":0,"price":0,"distance":0,"rating":0,"popularity":0,"freshness":0,"availability":0}',
-      }),
-    ).toThrow(/positive total/);
-  });
-
   it('parses AI search provider settings', () => {
     const env = validate({
       ...baseConfig,
       AI_SEARCH_ENABLED: 'true',
       AI_SEARCH_MODEL: ' gpt-oss:120b-cloud ',
       AI_SEARCH_TIMEOUT_MS: '9000',
-      AI_SEARCH_VERIFICATION_ENABLED: 'true',
-      AI_SEARCH_VERIFICATION_TIMEOUT_MS: '4500',
-      AI_SEARCH_VERIFICATION_BATCH_SIZE: '30',
-      AI_SEARCH_MIN_CONFIDENCE: '0.7',
       AI_SEARCH_DAILY_LIMIT_PER_USER: '250',
-      AI_SEARCH_RANKING_V2_ENABLED: 'true',
-      AI_SEARCH_DIVERSITY_ENABLED: 'false',
-      AI_SEARCH_MAX_ITEMS_PER_RESTAURANT: '4',
-      AI_SEARCH_RANKING_WEIGHTS:
-        '{"retrieval":7,"nutrition":3,"price":2,"distance":2,"rating":2,"popularity":2,"freshness":1,"availability":1}',
       AI_SEARCH_EMBEDDING_BASE_URL: ' http://localhost:11434 ',
       AI_SEARCH_EMBEDDING_MODEL: ' embeddinggemma ',
       AI_SEARCH_EMBEDDING_VERSION: ' 2 ',
@@ -132,15 +119,7 @@ describe('environment schema observability settings', () => {
     expect(env.AI_SEARCH_ENABLED).toBe(true);
     expect(env.AI_SEARCH_MODEL).toBe('gpt-oss:120b-cloud');
     expect(env.AI_SEARCH_TIMEOUT_MS).toBe(9000);
-    expect(env.AI_SEARCH_VERIFICATION_ENABLED).toBe(true);
-    expect(env.AI_SEARCH_VERIFICATION_TIMEOUT_MS).toBe(4500);
-    expect(env.AI_SEARCH_VERIFICATION_BATCH_SIZE).toBe(30);
-    expect(env.AI_SEARCH_MIN_CONFIDENCE).toBe(0.7);
     expect(env.AI_SEARCH_DAILY_LIMIT_PER_USER).toBe(250);
-    expect(env.AI_SEARCH_RANKING_V2_ENABLED).toBe(true);
-    expect(env.AI_SEARCH_DIVERSITY_ENABLED).toBe(false);
-    expect(env.AI_SEARCH_MAX_ITEMS_PER_RESTAURANT).toBe(4);
-    expect(env.AI_SEARCH_RANKING_WEIGHTS).toContain('"retrieval":7');
     expect(env.AI_SEARCH_EMBEDDING_BASE_URL).toBe('http://localhost:11434');
     expect(env.AI_SEARCH_EMBEDDING_MODEL).toBe('embeddinggemma');
     expect(env.AI_SEARCH_EMBEDDING_VERSION).toBe('2');

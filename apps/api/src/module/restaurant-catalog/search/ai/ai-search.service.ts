@@ -1,51 +1,76 @@
-import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import {
-  recordAiSearch,
-  recordAiSearchBranch,
-  recordAiSearchSemanticFallback,
-} from '@/observability/domain-metrics';
+  BadRequestException,
+  Injectable,
+  Logger,
+  Optional,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { recordAiSearch } from '@/observability/domain-metrics';
+import {
+  OllamaAiProvider,
+  type AiChatMessage,
+} from '@/lib/ai/ollama-ai.provider';
 import { AiSearchEmbeddingService } from '../indexing/ai-search-embedding.service';
-import { normalizeSearchText } from '../indexing/ai-search-document';
 import { SearchService } from '../standard/search.service';
 import type { AiSearchRequestDto } from './ai-search.dto';
-import {
-  AiSearchIntentService,
-  isGenericFoodSearchQuery,
-} from './ai-search-intent.service';
-import { AiSearchRankingService } from './ai-search-ranking.service';
-import { AiSearchVerificationService } from './ai-search-verification.service';
+import { aiSearchIntentSchema } from './ai-search-intent.schema';
+import { AI_SEARCH_SYSTEM_PROMPT } from './ai-search-prompt';
 import { AiSearchRepository } from './ai-search.repository';
 import {
   AI_SEARCH_DEFAULT_RADIUS_KM,
-  AI_SEARCH_MIN_CONFIDENCE,
   type AiSearchAppliedFilter,
   type AiSearchFallbackReason,
-  type AiSearchFollowUp,
-  type AiSearchIntent,
-  type AiSearchItemKind,
+  type AiSearchFilters,
   type AiSearchItemCandidate,
   type AiSearchItemResult,
-  type AiSearchRepositoryFilters,
   type AiSearchResponse,
-  type AiSearchRestaurantCandidate,
-  type AiSearchRetrievalBranch,
 } from './ai-search.types';
 
 const DEFAULT_PAGE_SIZE = 20;
 const MAX_PAGE_SIZE = 100;
-const MAX_BRANCH_ROWS = 150;
-const DEFAULT_BUDGET_RELAXATION_MULTIPLIER = 1.2;
-const DEFAULT_BUDGET_RELAXATION_INCREMENT_VND = 10_000;
+const AI_SEARCH_TIMEOUT_MS = 8_000;
+const AI_SEARCH_RESPONSE_SCHEMA_PROMPT = [
+  'JSON shape:',
+  '{',
+  '  "filters": {',
+  '    "minPriceVnd": "integer | omitted",',
+  '    "maxPriceVnd": "integer | omitted",',
+  '    "minProteinG": "number | omitted",',
+  '    "maxCalories": "number | omitted",',
+  '    "maxFatG": "number | omitted",',
+  '    "maxCarbsG": "number | omitted",',
+  '    "minRating": "number | omitted",',
+  '    "minReviewCount": "integer | omitted",',
+  '    "itemKind": "food|beverage|mixed | omitted",',
+  '    "isVegetarian": "boolean | omitted",',
+  '    "isVegan": "boolean | omitted",',
+  '    "isHalal": "boolean | omitted",',
+  '    "isGlutenFree": "boolean | omitted",',
+  '    "isDairyFree": "boolean | omitted"',
+  '  },',
+  '  "semanticQuery": "string"',
+  '}',
+].join('\n');
 
-interface QueryEmbeddingState {
-  embedding: number[];
-  model: string;
-  version: string;
+const DIETARY_FILTER_LABELS = [
+  ['isVegetarian', 'Vegetarian'],
+  ['isVegan', 'Vegan'],
+  ['isHalal', 'Halal'],
+  ['isGlutenFree', 'Gluten-free'],
+  ['isDairyFree', 'Dairy-free'],
+] as const satisfies ReadonlyArray<readonly [keyof AiSearchFilters, string]>;
+
+export class AiSearchRouterError extends Error {
+  constructor(readonly reason: AiSearchFallbackReason, message: string) {
+    super(message);
+    this.name = AiSearchRouterError.name;
+  }
 }
 
-interface BranchResult<T> {
-  branch: AiSearchRetrievalBranch;
-  rows: T[];
+interface RouterOptions {
+  radiusKm: number;
+  hasLocation: boolean;
+  now?: Date;
 }
 
 @Injectable()
@@ -54,11 +79,10 @@ export class AiSearchService {
 
   constructor(
     private readonly repo: AiSearchRepository,
-    private readonly intentService: AiSearchIntentService,
     private readonly standardSearch: SearchService,
     private readonly embeddings: AiSearchEmbeddingService,
-    private readonly ranking: AiSearchRankingService,
-    private readonly verification: AiSearchVerificationService,
+    @Optional() private readonly aiProvider?: OllamaAiProvider,
+    @Optional() private readonly config?: ConfigService,
   ) {}
 
   async search(request: AiSearchRequestDto): Promise<AiSearchResponse> {
@@ -69,270 +93,69 @@ export class AiSearchService {
     const radiusKm = request.radiusKm ?? AI_SEARCH_DEFAULT_RADIUS_KM;
 
     if (!query) {
-      return this.emptyAiResponse(
-        query,
-        'Enter a food search to start.',
-        startedAt,
-      );
+      return this.emptyResponse(query, startedAt);
     }
-
     if ((request.lat === undefined) !== (request.lon === undefined)) {
       throw new BadRequestException(
         'lat and lon must both be provided together for AI search',
       );
     }
 
+    let plan;
     try {
-      const intent = await this.intentService.parseIntentWithProvider(query, {
+      plan = await this.parseQueryPlan(query, {
         radiusKm,
+        hasLocation: request.lat !== undefined && request.lon !== undefined,
       });
-      const minConfidence = resolveMinConfidence();
-
-      if (this.shouldFallbackToClassicFoodName(intent, minConfidence)) {
-        return this.fallbackToClassic(
-          query,
-          request,
-          'EXACT_FOOD_NAME',
-          startedAt,
-        );
-      }
-
-      if (this.isBelowConfidenceThreshold(intent, minConfidence)) {
-        return this.emptyAiResponse(
-          query,
-          'No clear food matches found.',
-          startedAt,
-        );
-      }
-
-      const normalizedQuery = normalizeSearchText(
-        intent.rewrittenQuery || query,
-      );
-      const genericFoodBrowse = this.isGenericFoodBrowseIntent(intent, query);
-      const queryEmbedding = genericFoodBrowse
-        ? null
-        : await this.resolveQueryEmbedding(intent.rewrittenQuery || query);
-      const branches = this.buildRetrievalBranches(intent, request, {
-        genericFoodBrowse,
-        hasSemantic: Boolean(queryEmbedding),
-        normalizedQuery,
-      });
-      const branchLimit = Math.min(
-        MAX_BRANCH_ROWS,
-        Math.max(limit * 4, DEFAULT_PAGE_SIZE),
-      );
-      const branchFilters = this.buildRepositoryFilters({
-        intent,
-        branches,
-        query,
-        normalizedQuery,
-        queryEmbedding,
-        request,
-        radiusKm,
-        branchLimit,
-      });
-
-      const [initialItemBranches, restaurantBranches] = await Promise.all([
-        Promise.all(
-          branchFilters.map((filters) => this.findItemsForBranch(filters)),
-        ),
-        Promise.all(
-          branchFilters
-            .filter((filters) => this.shouldRetrieveRestaurants(filters))
-            .map((filters) => this.findRestaurantsForBranch(filters)),
-        ),
-      ]);
-      let itemBranches = initialItemBranches;
-      let effectiveIntent = intent;
-
-      if (this.shouldRelaxDefaultBudgetForItems(intent, query, itemBranches)) {
-        const relaxedIntent = relaxDefaultBudgetIntent(intent);
-        const relaxedBranches = this.buildRetrievalBranches(
-          relaxedIntent,
-          request,
-          {
-            genericFoodBrowse: false,
-            hasSemantic: Boolean(queryEmbedding),
-            normalizedQuery,
-          },
-        );
-        const relaxedBranchFilters = this.buildRepositoryFilters({
-          intent: relaxedIntent,
-          branches: relaxedBranches,
-          query,
-          normalizedQuery,
-          queryEmbedding,
-          request,
-          radiusKm,
-          branchLimit,
-        });
-        const relaxedItemBranches = await Promise.all(
-          relaxedBranchFilters.map((filters) =>
-            this.findItemsForBranch(filters),
-          ),
-        );
-
-        if (relaxedItemBranches.some((result) => result.rows.length > 0)) {
-          effectiveIntent = relaxedIntent;
-          itemBranches = relaxedItemBranches;
-        }
-      }
-
-      this.recordSemanticFallback(branches, itemBranches, restaurantBranches);
-
-      const rankedItems = this.ranking.rankItems(
-        this.mergeItems(itemBranches.flatMap((result) => result.rows)),
-        effectiveIntent,
-        request,
-        { radiusKm },
-      );
-      const rankedRestaurants = this.ranking.rankRestaurants(
-        this.mergeRestaurants(
-          restaurantBranches.flatMap((result) => result.rows),
-        ),
-        effectiveIntent,
-        { radiusKm },
-      );
-
-      const requiresSemanticVerification =
-        this.verification.requiresVerification(effectiveIntent);
-      const verifiedItems = await this.verifyRankedItems(
-        query,
-        effectiveIntent,
-        rankedItems,
-        offset + limit,
-        new Set(rankedRestaurants.map((restaurant) => restaurant.id)),
-      );
-      const verifiedRestaurantIds = new Set(
-        verifiedItems.map((item) => item.restaurant.id),
-      );
-      const verifiedRestaurants = requiresSemanticVerification
-        ? rankedRestaurants.filter((restaurant) =>
-            verifiedRestaurantIds.has(restaurant.id),
-          )
-        : rankedRestaurants;
-
-      const items = verifiedItems.slice(offset, offset + limit);
-      const restaurants = verifiedRestaurants.slice(offset, offset + limit);
-      const response: AiSearchResponse = {
-        mode: 'ai',
-        query,
-        interpretation: this.buildInterpretation(effectiveIntent, request),
-        appliedFilters: this.buildAppliedFilters(
-          effectiveIntent,
-          request,
-          radiusKm,
-        ),
-        restaurants,
-        items,
-        total: {
-          restaurants: verifiedRestaurants.length,
-          items: verifiedItems.length,
-        },
-        followUps: this.buildFollowUps(effectiveIntent, query, request),
-        fallback: null,
-      };
-
-      this.recordSearch(response, startedAt);
-      return response;
     } catch (error) {
-      this.logger.warn(
-        `AI search fell back after parse/retrieval error: ${
-          error instanceof Error ? error.message : 'unknown error'
-        }`,
-      );
-      return this.emptyAiResponse(
+      return this.fallbackToClassic(
         query,
-        'AI search is unavailable right now.',
+        request,
+        this.routerFailureReason(error),
         startedAt,
       );
     }
-  }
 
-  private async verifyRankedItems(
-    query: string,
-    intent: AiSearchIntent,
-    rankedItems: AiSearchItemResult[],
-    requiredResultCount: number,
-    candidateRestaurantIds: Set<string>,
-  ): Promise<AiSearchItemResult[]> {
-    if (!this.verification.requiresVerification(intent)) return rankedItems;
-
-    const verifiedItems: AiSearchItemResult[] = [];
-    const verifiedRestaurantIds = new Set<string>();
-    const requiredRestaurantCount = Math.min(
-      requiredResultCount,
-      candidateRestaurantIds.size,
-    );
-    const batchSize = this.verification.getBatchSize();
-
-    for (let start = 0; start < rankedItems.length; start += batchSize) {
-      const batch = rankedItems.slice(start, start + batchSize);
-      const result = await this.verification.verifyCandidates(
-        query,
-        intent,
-        batch,
+    let embedding: number[];
+    try {
+      embedding = await this.embeddings.embedSearchDocument(plan.semanticQuery);
+    } catch (error) {
+      this.logger.warn(
+        `AI search embedding failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
       );
-
-      if (result.status === 'skipped') return rankedItems;
-
-      for (const item of batch) {
-        if (!result.acceptedItemIds.has(item.id)) continue;
-        verifiedItems.push(item);
-        if (candidateRestaurantIds.has(item.restaurant.id)) {
-          verifiedRestaurantIds.add(item.restaurant.id);
-        }
-      }
-
-      if (result.status === 'failed') {
-        if (result.strict) return [];
-        return [...verifiedItems, ...rankedItems.slice(start + batch.length)];
-      }
-
-      if (
-        verifiedItems.length >= requiredResultCount &&
-        verifiedRestaurantIds.size >= requiredRestaurantCount
-      ) {
-        break;
-      }
+      return this.fallbackToClassic(
+        query,
+        request,
+        'EMBEDDING_FAILED',
+        startedAt,
+      );
     }
 
-    return verifiedItems;
-  }
-
-  private shouldFallbackToClassicFoodName(
-    intent: AiSearchIntent,
-    minConfidence: number,
-  ): boolean {
-    return (
-      Boolean(intent.foodNameOnly) &&
-      !this.isBelowConfidenceThreshold(intent, minConfidence)
+    const embeddingConfig = this.embeddings.getConfig();
+    const candidates = await this.repo.findItems({
+      filters: plan.filters,
+      queryEmbedding: embedding,
+      embeddingModel: embeddingConfig.model,
+      embeddingVersion: embeddingConfig.version,
+      lat: request.lat,
+      lon: request.lon,
+      radiusKm,
+      limit,
+      offset,
+    });
+    const items = candidates.map((candidate) =>
+      this.toItemResult(candidate, plan.filters),
     );
-  }
-
-  private isBelowConfidenceThreshold(
-    intent: AiSearchIntent,
-    minConfidence: number,
-  ): boolean {
-    return intent.needsFallback || intent.confidence < minConfidence;
-  }
-
-  private emptyAiResponse(
-    query: string,
-    interpretation: string,
-    startedAt: number,
-  ): AiSearchResponse {
     const response: AiSearchResponse = {
       mode: 'ai',
       query,
-      interpretation,
-      appliedFilters: [],
+      interpretation: `Showing menu items matching "${plan.semanticQuery}".`,
+      appliedFilters: this.buildAppliedFilters(plan.filters),
       restaurants: [],
-      items: [],
-      total: {
-        restaurants: 0,
-        items: 0,
-      },
+      items,
+      total: { restaurants: 0, items: items.length },
       followUps: [],
       fallback: null,
     };
@@ -340,6 +163,82 @@ export class AiSearchService {
     this.recordSearch(response, startedAt);
     return response;
   }
+
+  private async parseQueryPlan(
+    query: string,
+    options: RouterOptions,
+  ) {
+    if (!this.shouldUseAiProvider()) {
+      throw new AiSearchRouterError(
+        'ROUTER_UNAVAILABLE',
+        'AI search router is not enabled or configured.',
+      );
+    }
+
+    let content: string;
+    try {
+      const response = await this.aiProvider!.chat({
+        messages: this.buildRouterMessages(query, options),
+        model: this.resolveAiSearchModel(),
+        timeoutMs: this.resolveAiSearchTimeoutMs(),
+        temperature: 0,
+      });
+      content = response.content;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`AI search router failed: ${message}`);
+      throw new AiSearchRouterError('ROUTER_UNAVAILABLE', message);
+    }
+
+    try {
+      return aiSearchIntentSchema.parse(JSON.parse(content));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`AI search router returned invalid JSON: ${message}`);
+      throw new AiSearchRouterError('ROUTER_INVALID_RESPONSE', message);
+    }
+  }
+
+  private shouldUseAiProvider(): boolean {
+    return (
+      this.readBooleanConfig('AI_SEARCH_ENABLED', false) &&
+      Boolean(this.aiProvider?.isConfigured())
+    );
+  }
+
+  private resolveAiSearchModel(): string | undefined {
+    const model = this.config?.get<string>('AI_SEARCH_MODEL')?.trim();
+    return model && model.length > 0 ? model : undefined;
+  }
+
+  private resolveAiSearchTimeoutMs(): number {
+    const value = Number(
+      this.config?.get<number | string>('AI_SEARCH_TIMEOUT_MS'),
+    );
+    return Number.isInteger(value) && value > 0 ? value : AI_SEARCH_TIMEOUT_MS;
+  }
+
+  private buildRouterMessages(
+    query: string,
+    options: RouterOptions,
+  ): AiChatMessage[] {
+    return [
+      {
+        role: 'system',
+        content: `${AI_SEARCH_SYSTEM_PROMPT}\n\n${AI_SEARCH_RESPONSE_SCHEMA_PROMPT}`,
+      },
+      {
+        role: 'user',
+        content: JSON.stringify({
+          query: query.trim().slice(0, 300),
+          currentTime: (options.now ?? new Date()).toISOString(),
+          locationAvailable: options.hasLocation,
+          defaultRadiusKm: options.radiusKm,
+        }),
+      },
+    ];
+  }
+
   private async fallbackToClassic(
     query: string,
     request: AiSearchRequestDto,
@@ -357,7 +256,6 @@ export class AiSearchService {
       request.offset,
       request.limit,
     );
-
     const response: AiSearchResponse = {
       mode: 'classic_fallback',
       query,
@@ -371,366 +269,130 @@ export class AiSearchService {
         ...item,
         score: Number(item.score ?? 0),
         matchReasons: [],
+        nutrition: null,
       })),
       total: classic.total,
       followUps: [],
       fallback: { reason },
     };
-
     this.recordSearch(response, startedAt);
     return response;
   }
 
-  private buildRepositoryFilters(options: {
-    intent: AiSearchIntent;
-    branches: AiSearchRetrievalBranch[];
-    query: string;
-    normalizedQuery: string;
-    queryEmbedding: QueryEmbeddingState | null;
-    request: AiSearchRequestDto;
-    radiusKm: number;
-    branchLimit: number;
-  }): AiSearchRepositoryFilters[] {
-    return options.branches.map(
-      (branch): AiSearchRepositoryFilters => ({
-        intent: options.intent,
-        branch,
-        query: options.query,
-        normalizedQuery: options.normalizedQuery,
-        queryEmbedding: options.queryEmbedding?.embedding,
-        embeddingModel: options.queryEmbedding?.model,
-        embeddingVersion: options.queryEmbedding?.version,
-        lat: options.request.lat,
-        lon: options.request.lon,
-        radiusKm: options.radiusKm,
-        limit: options.branchLimit,
-      }),
-    );
+  private emptyResponse(query: string, startedAt: number): AiSearchResponse {
+    const response: AiSearchResponse = {
+      mode: 'ai',
+      query,
+      interpretation: 'Enter a food search to start.',
+      appliedFilters: [],
+      restaurants: [],
+      items: [],
+      total: { restaurants: 0, items: 0 },
+      followUps: [],
+      fallback: null,
+    };
+    this.recordSearch(response, startedAt);
+    return response;
   }
 
-  private isGenericFoodBrowseIntent(
-    intent: AiSearchIntent,
-    query: string,
-  ): boolean {
-    return (
-      isGenericFoodSearchQuery(query) &&
-      intent.foodTerms.length === 0 &&
-      intent.dietaryTags.length === 0 &&
-      intent.cuisineTerms.length === 0 &&
-      intent.nutrition.proteinMinG === undefined &&
-      !intent.nutrition.lowerCalorie &&
-      intent.nutrition.caloriesMax === undefined &&
-      intent.nutrition.fatMaxG === undefined &&
-      intent.nutrition.carbsMaxG === undefined &&
-      intent.price.maxPriceVnd === undefined &&
-      intent.price.minPriceVnd === undefined &&
-      intent.rating.minAverageRating === undefined &&
-      intent.rating.minReviewCount === undefined
-    );
+  private toItemResult(
+    candidate: AiSearchItemCandidate,
+    filters: AiSearchFilters,
+  ): AiSearchItemResult {
+    const { semanticDistance, ...item } = candidate;
+    return {
+      ...item,
+      score: Math.round(
+        Math.max(0, Math.min(1, 1 - semanticDistance)) * 100,
+      ),
+      matchReasons: this.buildMatchReasons(candidate, filters),
+    };
   }
 
-  private shouldRelaxDefaultBudgetForItems(
-    intent: AiSearchIntent,
-    query: string,
-    itemBranches: BranchResult<AiSearchItemCandidate>[],
-  ): boolean {
-    return (
-      !itemBranches.some((result) => result.rows.length > 0) &&
-      Boolean(intent.price.budgetIntent) &&
-      intent.price.maxPriceVnd !== undefined &&
-      intent.nutrition.proteinMinG !== undefined &&
-      !hasExplicitPriceConstraint(query)
-    );
+  private buildMatchReasons(
+    item: AiSearchItemCandidate,
+    filters: AiSearchFilters,
+  ): string[] {
+    const reasons: string[] = [];
+    if (filters.maxPriceVnd !== undefined) {
+      reasons.push(`Under ${formatVnd(filters.maxPriceVnd)} VND`);
+    }
+    if (filters.minPriceVnd !== undefined) {
+      reasons.push(`At least ${formatVnd(filters.minPriceVnd)} VND`);
+    }
+    const protein = item.nutrition?.protein;
+    if (filters.minProteinG !== undefined && protein != null) {
+      reasons.push(`${formatNumber(protein)}g protein`);
+    }
+    const calories = item.nutrition?.calories;
+    if (filters.maxCalories !== undefined && calories != null) {
+      reasons.push(`${formatNumber(calories)} calories`);
+    }
+    const fat = item.nutrition?.fat;
+    if (filters.maxFatG !== undefined && fat != null) {
+      reasons.push(`${formatNumber(fat)}g fat`);
+    }
+    const carbs = item.nutrition?.carbs;
+    if (filters.maxCarbsG !== undefined && carbs != null) {
+      reasons.push(`${formatNumber(carbs)}g carbs`);
+    }
+    if (filters.minRating !== undefined) {
+      reasons.push(`${item.restaurant.averageRating.toFixed(1)} rating`);
+    }
+    if (filters.minReviewCount !== undefined) {
+      reasons.push(`${item.restaurant.reviewCount} reviews`);
+    }
+    if (filters.itemKind !== undefined) {
+      reasons.push(formatItemKind(filters.itemKind));
+    }
+    for (const [key, label] of DIETARY_FILTER_LABELS) {
+      if (filters[key] === true) reasons.push(label);
+    }
+    return reasons;
   }
 
-  private buildRetrievalBranches(
-    intent: AiSearchIntent,
-    request: AiSearchRequestDto,
-    options: {
-      genericFoodBrowse: boolean;
-      hasSemantic: boolean;
-      normalizedQuery: string;
-    },
-  ): AiSearchRetrievalBranch[] {
-    const branches = new Set<AiSearchRetrievalBranch>();
-    const hasTerms =
-      intent.foodTerms.length > 0 ||
-      intent.dietaryTags.length > 0 ||
-      intent.cuisineTerms.length > 0;
+  private buildAppliedFilters(filters: AiSearchFilters): AiSearchAppliedFilter[] {
+    const applied: AiSearchAppliedFilter[] = [];
+    const add = (key: string, label: string) =>
+      applied.push({ key, label, source: 'ai_inferred' });
 
-    if (options.genericFoodBrowse) {
-      branches.add('lexical');
-    } else if (options.normalizedQuery.length > 0) {
-      branches.add('fulltext');
-      branches.add('trigram');
-      if (options.hasSemantic) branches.add('semantic');
+    if (filters.minPriceVnd !== undefined)
+      add('minPriceVnd', `Price from ${formatVnd(filters.minPriceVnd)} VND`);
+    if (filters.maxPriceVnd !== undefined)
+      add('maxPriceVnd', `Up to ${formatVnd(filters.maxPriceVnd)} VND`);
+    if (filters.minProteinG !== undefined)
+      add('minProteinG', `Protein ≥ ${formatNumber(filters.minProteinG)}g`);
+    if (filters.maxCalories !== undefined)
+      add('maxCalories', `Calories ≤ ${formatNumber(filters.maxCalories)}`);
+    if (filters.maxFatG !== undefined)
+      add('maxFatG', `Fat ≤ ${formatNumber(filters.maxFatG)}g`);
+    if (filters.maxCarbsG !== undefined)
+      add('maxCarbsG', `Carbs ≤ ${formatNumber(filters.maxCarbsG)}g`);
+    if (filters.minRating !== undefined)
+      add('minRating', `Rating ≥ ${formatNumber(filters.minRating)}`);
+    if (filters.minReviewCount !== undefined)
+      add('minReviewCount', `At least ${filters.minReviewCount} reviews`);
+    if (filters.itemKind !== undefined)
+      add('itemKind', formatItemKind(filters.itemKind));
+    for (const [key, label] of DIETARY_FILTER_LABELS) {
+      if (filters[key] === true) add(key, label);
     }
-    if (hasTerms) {
-      branches.add('lexical');
-      branches.add('tag');
-    }
-    if (
-      intent.nutrition.lowerCalorie ||
-      intent.nutrition.proteinMinG !== undefined ||
-      intent.nutrition.caloriesMax !== undefined ||
-      intent.nutrition.fatMaxG !== undefined ||
-      intent.nutrition.carbsMaxG !== undefined
-    ) {
-      branches.add('nutrition');
-    }
-    if (intent.price.maxPriceVnd !== undefined) branches.add('price');
-    if (intent.rating.minAverageRating !== undefined) branches.add('rating');
-    if (request.lat !== undefined && request.lon !== undefined)
-      branches.add('geo');
-
-    if (branches.size === 0 && options.normalizedQuery.length > 0) {
-      branches.add('fulltext');
-      branches.add('trigram');
-    }
-    if (branches.size === 0) branches.add('lexical');
-    return Array.from(branches);
+    return applied;
   }
 
-  private shouldRetrieveRestaurants(
-    filters: AiSearchRepositoryFilters,
-  ): boolean {
-    return (
-      filters.branch === 'lexical' ||
-      filters.branch === 'fulltext' ||
-      filters.branch === 'trigram' ||
-      filters.branch === 'semantic' ||
-      filters.branch === 'tag' ||
-      filters.branch === 'nutrition' ||
-      filters.branch === 'rating' ||
-      filters.branch === 'geo'
-    );
+  private routerFailureReason(error: unknown): AiSearchFallbackReason {
+    return error instanceof AiSearchRouterError
+      ? error.reason
+      : 'ROUTER_UNAVAILABLE';
   }
 
-  private mergeItems(items: AiSearchItemCandidate[]): AiSearchItemCandidate[] {
-    const merged = new Map<string, AiSearchItemCandidate>();
-
-    for (const item of items) {
-      const existing = merged.get(item.id);
-      if (!existing) {
-        merged.set(item.id, {
-          ...item,
-          retrievalBranches: [...item.retrievalBranches],
-        });
-        continue;
-      }
-
-      existing.retrievalBranches = Array.from(
-        new Set([...existing.retrievalBranches, ...item.retrievalBranches]),
-      );
-      existing.branchScores = mergeBranchScores(
-        existing.branchScores,
-        item.branchScores,
-      );
+  private readBooleanConfig(key: string, fallback: boolean): boolean {
+    const value = this.config?.get<boolean | string>(key);
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      return ['1', 'true', 'yes'].includes(value.trim().toLowerCase());
     }
-
-    return Array.from(merged.values());
-  }
-
-  private mergeRestaurants(
-    restaurants: AiSearchRestaurantCandidate[],
-  ): AiSearchRestaurantCandidate[] {
-    const merged = new Map<string, AiSearchRestaurantCandidate>();
-
-    for (const restaurant of restaurants) {
-      const existing = merged.get(restaurant.id);
-      if (!existing) {
-        merged.set(restaurant.id, {
-          ...restaurant,
-          retrievalBranches: [...(restaurant.retrievalBranches ?? [])],
-        });
-        continue;
-      }
-
-      existing.retrievalBranches = Array.from(
-        new Set([
-          ...(existing.retrievalBranches ?? []),
-          ...(restaurant.retrievalBranches ?? []),
-        ]),
-      );
-      existing.branchScores = mergeBranchScores(
-        existing.branchScores,
-        restaurant.branchScores,
-      );
-    }
-
-    return Array.from(merged.values());
-  }
-
-  private buildAppliedFilters(
-    intent: AiSearchIntent,
-    request: AiSearchRequestDto,
-    radiusKm: number,
-  ): AiSearchAppliedFilter[] {
-    const filters: AiSearchAppliedFilter[] = [];
-
-    if (intent.itemKinds.length > 0) {
-      filters.push({
-        key: 'itemKinds',
-        label:
-          intent.itemKinds.length === 1
-            ? `${formatItemKind(intent.itemKinds[0])} only`
-            : intent.itemKinds.map(formatItemKind).join(' or '),
-        source: 'ai_inferred',
-      });
-    }
-
-    if (intent.dietaryTags.length > 0) {
-      filters.push({
-        key: 'dietaryTags',
-        label: `Dietary tags: ${intent.dietaryTags.join(', ')}`,
-        source: 'ai_inferred',
-      });
-    }
-
-    if (intent.excludedTerms.length > 0) {
-      filters.push({
-        key: 'excludedTerms',
-        label: `Excluding: ${intent.excludedTerms.join(', ')}`,
-        source: 'ai_inferred',
-      });
-    }
-
-    if (intent.nutrition.lowerCalorie) {
-      filters.push({
-        key: 'lowerCalorie',
-        label: 'Verified nutrition, lowest calories first',
-        source: 'ai_inferred',
-      });
-    }
-
-    if (intent.nutrition.proteinMinG !== undefined) {
-      filters.push({
-        key: 'proteinMinG',
-        label: `Protein >= ${intent.nutrition.proteinMinG}g`,
-        source: 'ai_inferred',
-      });
-    }
-    if (intent.nutrition.caloriesMax !== undefined) {
-      filters.push({
-        key: 'caloriesMax',
-        label: `Calories <= ${intent.nutrition.caloriesMax} kcal`,
-        source: 'ai_inferred',
-      });
-    }
-    if (intent.nutrition.fatMaxG !== undefined) {
-      filters.push({
-        key: 'fatMaxG',
-        label: `Fat <= ${intent.nutrition.fatMaxG}g`,
-        source: 'ai_inferred',
-      });
-    }
-    if (intent.price.maxPriceVnd !== undefined) {
-      filters.push({
-        key: 'maxPriceVnd',
-        label: `Price <= ${intent.price.maxPriceVnd} VND`,
-        source: intent.price.budgetIntent ? 'system_default' : 'ai_inferred',
-      });
-    }
-    if (intent.price.minPriceVnd !== undefined) {
-      filters.push({
-        key: 'minPriceVnd',
-        label: `Price >= ${intent.price.minPriceVnd} VND`,
-        source: 'ai_inferred',
-      });
-    }
-    if (intent.rating.minAverageRating !== undefined) {
-      filters.push({
-        key: 'minAverageRating',
-        label: `Rating >= ${intent.rating.minAverageRating}`,
-        source: 'ai_inferred',
-      });
-    }
-    if (intent.rating.minReviewCount !== undefined) {
-      filters.push({
-        key: 'minReviewCount',
-        label: `Review count >= ${intent.rating.minReviewCount}`,
-        source: 'ai_inferred',
-      });
-    }
-    if (request.lat !== undefined && request.lon !== undefined) {
-      filters.push({
-        key: 'radiusKm',
-        label: `Within ${radiusKm} km`,
-        source: 'request',
-      });
-    }
-
-    return filters;
-  }
-
-  private buildInterpretation(
-    intent: AiSearchIntent,
-    request: AiSearchRequestDto,
-  ): string {
-    const nearby = request.lat !== undefined && request.lon !== undefined;
-
-    if (intent.nutrition.lowerCalorie) {
-      const kind =
-        intent.itemKinds.length === 1
-          ? formatItemKind(intent.itemKinds[0]).toLowerCase()
-          : 'items';
-      return `Showing ${kind} with verified nutrition, ordered by calories per serving.`;
-    }
-
-    if (intent.nutrition.highProtein && nearby) {
-      return 'Showing nearby high-protein food options.';
-    }
-    if (intent.nutrition.highProtein) {
-      return 'Showing high-protein food options.';
-    }
-    if (intent.rating.minAverageRating !== undefined && nearby) {
-      return 'Showing nearby food from highly rated restaurants.';
-    }
-    if (intent.rating.minAverageRating !== undefined) {
-      return 'Showing food from highly rated restaurants.';
-    }
-    if (intent.price.budgetIntent || intent.price.maxPriceVnd !== undefined) {
-      return 'Showing budget-friendly food.';
-    }
-    if (nearby) {
-      return 'Showing nearby food matches.';
-    }
-    return `Showing food matches for "${intent.rewrittenQuery}".`;
-  }
-
-  private buildFollowUps(
-    intent: AiSearchIntent,
-    query: string,
-    request: AiSearchRequestDto,
-  ): AiSearchFollowUp[] {
-    const followUps: AiSearchFollowUp[] = [];
-
-    if (intent.price.maxPriceVnd === undefined) {
-      followUps.push({
-        label: 'Cheaper',
-        query: `${query} under 50000`,
-      });
-    }
-    if (request.lat !== undefined && request.lon !== undefined) {
-      followUps.push({
-        label: 'Nearer',
-        query: `${query} within 2 km`,
-      });
-    }
-    if (intent.nutrition.proteinMinG === undefined) {
-      followUps.push({
-        label: 'Higher protein',
-        query: `high protein ${query}`,
-      });
-    }
-    if (intent.rating.minAverageRating === undefined) {
-      followUps.push({
-        label: 'Highly rated',
-        query: `highly rated ${query}`,
-      });
-    }
-
-    return followUps.slice(0, 4);
+    return fallback;
   }
 
   private recordSearch(response: AiSearchResponse, startedAt: number): void {
@@ -742,129 +404,18 @@ export class AiSearchService {
       latencyMs: Date.now() - startedAt,
     });
   }
-
-  private async resolveQueryEmbedding(
-    query: string,
-  ): Promise<QueryEmbeddingState | null> {
-    try {
-      const config = this.embeddings.getConfig();
-      const embedding = await this.embeddings.embedSearchDocument(query);
-      return {
-        embedding,
-        model: config.model,
-        version: config.version,
-      };
-    } catch (error) {
-      recordAiSearchSemanticFallback('query_embedding_failed');
-      this.logger.debug(
-        `AI search semantic branch disabled: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-      return null;
-    }
-  }
-
-  private async findItemsForBranch(
-    filters: AiSearchRepositoryFilters,
-  ): Promise<BranchResult<AiSearchItemCandidate>> {
-    const startedAt = Date.now();
-    const rows = await this.repo.findItems(filters);
-    recordAiSearchBranch({
-      branch: filters.branch,
-      target: 'items',
-      hitCount: rows.length,
-      latencyMs: Date.now() - startedAt,
-    });
-    return { branch: filters.branch, rows };
-  }
-
-  private async findRestaurantsForBranch(
-    filters: AiSearchRepositoryFilters,
-  ): Promise<BranchResult<AiSearchRestaurantCandidate>> {
-    const startedAt = Date.now();
-    const rows = await this.repo.findRestaurants(filters);
-    recordAiSearchBranch({
-      branch: filters.branch,
-      target: 'restaurants',
-      hitCount: rows.length,
-      latencyMs: Date.now() - startedAt,
-    });
-    return { branch: filters.branch, rows };
-  }
-
-  private recordSemanticFallback(
-    branches: AiSearchRetrievalBranch[],
-    itemBranches: BranchResult<AiSearchItemCandidate>[],
-    restaurantBranches: BranchResult<AiSearchRestaurantCandidate>[],
-  ): void {
-    if (!branches.includes('semantic')) return;
-
-    const semanticHits = [...itemBranches, ...restaurantBranches]
-      .filter((result) => result.branch === 'semantic')
-      .reduce((total, result) => total + result.rows.length, 0);
-    if (semanticHits === 0) {
-      recordAiSearchSemanticFallback('no_fresh_results');
-    }
-  }
 }
 
-function relaxDefaultBudgetIntent(intent: AiSearchIntent): AiSearchIntent {
-  const maxPriceVnd = intent.price.maxPriceVnd;
-  if (maxPriceVnd === undefined) return intent;
-
-  const relaxedMaxPriceVnd = roundUpToNearestThousand(
-    Math.max(
-      maxPriceVnd * DEFAULT_BUDGET_RELAXATION_MULTIPLIER,
-      maxPriceVnd + DEFAULT_BUDGET_RELAXATION_INCREMENT_VND,
-    ),
-  );
-
-  return {
-    ...intent,
-    price: {
-      ...intent.price,
-      maxPriceVnd: relaxedMaxPriceVnd,
-    },
-  };
+function formatVnd(value: number): string {
+  return new Intl.NumberFormat('en-US').format(value);
 }
 
-function hasExplicitPriceConstraint(query: string): boolean {
-  const normalized = query.toLowerCase();
-  return (
-    /\b(?:under|below|less than|max|maximum|duoi)\s*\d[\d.,]*\s*(k|nghin|ngan|vnd)?\b/.test(
-      normalized,
-    ) || /<=?\s*\d[\d.,]*\s*(k|nghin|ngan|vnd)?\b/.test(normalized)
-  );
+function formatNumber(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
 }
 
-function roundUpToNearestThousand(value: number): number {
-  return Math.ceil(value / 1000) * 1000;
-}
-
-function resolveMinConfidence(): number {
-  const raw = Number(process.env.AI_SEARCH_MIN_CONFIDENCE);
-  return Number.isFinite(raw) ? raw : AI_SEARCH_MIN_CONFIDENCE;
-}
-
-function mergeBranchScores(
-  existing: Partial<Record<AiSearchRetrievalBranch, number>> | undefined,
-  incoming: Partial<Record<AiSearchRetrievalBranch, number>> | undefined,
-): Partial<Record<AiSearchRetrievalBranch, number>> {
-  const merged = { ...(existing ?? {}) };
-
-  for (const [branch, score] of Object.entries(incoming ?? {}) as [
-    AiSearchRetrievalBranch,
-    number,
-  ][]) {
-    merged[branch] = Math.max(merged[branch] ?? 0, score);
-  }
-
-  return merged;
-}
-
-function formatItemKind(kind: AiSearchItemKind): string {
-  if (kind === 'food') return 'Food';
+function formatItemKind(kind: AiSearchFilters['itemKind']): string {
   if (kind === 'beverage') return 'Beverage';
-  return 'Food + beverage';
+  if (kind === 'mixed') return 'Food and beverages';
+  return 'Food';
 }
