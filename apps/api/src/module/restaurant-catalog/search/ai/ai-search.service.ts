@@ -5,6 +5,7 @@ import {
   Optional,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { z } from 'zod';
 import { recordAiSearch } from '@/observability/domain-metrics';
 import {
   OllamaAiProvider,
@@ -13,7 +14,6 @@ import {
 import { AiSearchEmbeddingService } from '../indexing/ai-search-embedding.service';
 import { SearchService } from '../standard/search.service';
 import type { AiSearchRequestDto } from './ai-search.dto';
-import { aiSearchIntentSchema } from './ai-search-intent.schema';
 import { AI_SEARCH_SYSTEM_PROMPT } from './ai-search-prompt';
 import { AiSearchRepository } from './ai-search.repository';
 import {
@@ -25,6 +25,35 @@ import {
   type AiSearchItemResult,
   type AiSearchResponse,
 } from './ai-search.types';
+
+const optionalMoney = z.number().int().min(0).max(10_000_000).optional();
+const optionalNutrition = z.number().min(0).max(5_000).optional();
+
+const aiSearchFiltersSchema = z
+  .object({
+    minPriceVnd: optionalMoney,
+    maxPriceVnd: optionalMoney,
+    minProteinG: z.number().min(0).max(300).optional(),
+    maxCalories: optionalNutrition,
+    maxFatG: z.number().min(0).max(500).optional(),
+    maxCarbsG: z.number().min(0).max(1_000).optional(),
+    minRating: z.number().min(0).max(5).optional(),
+    minReviewCount: z.number().int().min(0).max(100_000).optional(),
+    itemKind: z.enum(['food', 'beverage', 'mixed']).optional(),
+    isVegetarian: z.boolean().optional(),
+    isVegan: z.boolean().optional(),
+    isHalal: z.boolean().optional(),
+    isGlutenFree: z.boolean().optional(),
+    isDairyFree: z.boolean().optional(),
+  })
+  .strict();
+
+const aiSearchIntentSchema = z
+  .object({
+    filters: aiSearchFiltersSchema,
+    semanticQuery: z.string().trim().min(1).max(300),
+  })
+  .strict();
 
 const DEFAULT_PAGE_SIZE = 20;
 const MAX_PAGE_SIZE = 100;

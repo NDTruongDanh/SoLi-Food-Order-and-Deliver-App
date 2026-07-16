@@ -1,11 +1,25 @@
 import type { ItemSearchRowDto } from '../standard/search.dto';
 import type { RestaurantSearchResultDto } from '../../restaurant/dto/restaurant.dto';
-import type { AiSearchFiltersSchema } from './ai-search-intent.schema';
 
 export const AI_SEARCH_DEFAULT_RADIUS_KM = 5;
 export const AI_SEARCH_MAX_QUERY_LENGTH = 300;
 
-export type AiSearchFilters = AiSearchFiltersSchema;
+export interface AiSearchFilters {
+  minPriceVnd?: number;
+  maxPriceVnd?: number;
+  minProteinG?: number;
+  maxCalories?: number;
+  maxFatG?: number;
+  maxCarbsG?: number;
+  minRating?: number;
+  minReviewCount?: number;
+  itemKind?: 'food' | 'beverage' | 'mixed';
+  isVegetarian?: boolean;
+  isVegan?: boolean;
+  isHalal?: boolean;
+  isGlutenFree?: boolean;
+  isDairyFree?: boolean;
+}
 
 export interface AiSearchQueryPlan {
   filters: AiSearchFilters;
