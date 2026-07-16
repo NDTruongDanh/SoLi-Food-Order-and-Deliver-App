@@ -90,7 +90,10 @@ const DIETARY_FILTER_LABELS = [
 ] as const satisfies ReadonlyArray<readonly [keyof AiSearchFilters, string]>;
 
 export class AiSearchRouterError extends Error {
-  constructor(readonly reason: AiSearchFallbackReason, message: string) {
+  constructor(
+    readonly reason: AiSearchFallbackReason,
+    message: string,
+  ) {
     super(message);
     this.name = AiSearchRouterError.name;
   }
@@ -193,10 +196,7 @@ export class AiSearchService {
     return response;
   }
 
-  private async parseQueryPlan(
-    query: string,
-    options: RouterOptions,
-  ) {
+  private async parseQueryPlan(query: string, options: RouterOptions) {
     if (!this.shouldUseAiProvider()) {
       throw new AiSearchRouterError(
         'ROUTER_UNAVAILABLE',
@@ -331,9 +331,7 @@ export class AiSearchService {
     const { semanticDistance, ...item } = candidate;
     return {
       ...item,
-      score: Math.round(
-        Math.max(0, Math.min(1, 1 - semanticDistance)) * 100,
-      ),
+      score: Math.round(Math.max(0, Math.min(1, 1 - semanticDistance)) * 100),
       matchReasons: this.buildMatchReasons(candidate, filters),
     };
   }
@@ -380,7 +378,9 @@ export class AiSearchService {
     return reasons;
   }
 
-  private buildAppliedFilters(filters: AiSearchFilters): AiSearchAppliedFilter[] {
+  private buildAppliedFilters(
+    filters: AiSearchFilters,
+  ): AiSearchAppliedFilter[] {
     const applied: AiSearchAppliedFilter[] = [];
     const add = (key: string, label: string) =>
       applied.push({ key, label, source: 'ai_inferred' });
