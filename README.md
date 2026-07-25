@@ -1,6 +1,6 @@
-# 🍔 SoLi Food Delivery Platform
+# 🍔 UITFood Food Ordering Platform
 
-SoLi is a modern, high-performance, and robust Food Ordering & Delivery platform. It provides a complete ecosystem for customers to order food, restaurants to manage their menus and operations, and administrators to oversee platform analytics and payouts.
+UITFood is a modern, high-performance, and robust Food Ordering & Delivery platform. It provides a complete ecosystem for customers to order food, restaurants to manage their menus and operations, and administrators to oversee platform analytics and payouts.
 
 Built as a **Monorepo** using Turborepo, it strictly adheres to scalable architectural patterns (like CQRS and Event-Driven snapshots for core domains) and utilizes a state-of-the-art technology stack.
 
@@ -59,8 +59,8 @@ Built as a **Monorepo** using Turborepo, it strictly adheres to scalable archite
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/your-username/soli-food-delivery.git
-   cd soli-food-delivery
+   git clone https://github.com/your-username/UITFood-food-delivery.git
+   cd UITFood-food-delivery
    ```
 
 2. **Install dependencies:**
@@ -91,12 +91,3 @@ Built as a **Monorepo** using Turborepo, it strictly adheres to scalable archite
 
 ---
 
-## 🤝 Contributing
-1. Fork the project.
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`).
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`).
-4. Push to the branch (`git push origin feature/AmazingFeature`).
-5. Open a Pull Request.
-
-## 📝 License
-Distributed under the MIT License. See `LICENSE` for more information.
